@@ -439,6 +439,13 @@ class BluetoothManager: ObservableObject {
                 if rawRssi != 127 {
                     rssiVal = rawRssi
                 }
+                
+                // Coexistence Ping: Force L2CAP traffic to elevate Bluetooth QoS and 
+                // prevent 2.4GHz Wi-Fi coexistence starvation. This mimics the macOS
+                // Sound Menu's battery polling behavior.
+                if address == selectedDeviceAddress {
+                    device.performSDPQuery(nil)
+                }
             }
             
             let model = BluetoothDeviceModel(
