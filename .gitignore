@@ -1,0 +1,34 @@
+# macOS System Files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Icon files
+Icon
+
+# Thumbnails
+._*
+
+# Files that might appear in the root of a volume
+.DocumentRevisions-V100
+.DirectoryService-Music
+.Spotlight-V100
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Directories potentially created on external volumes
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+
+# Compiled App Bundle (should be packaged as ZIP for releases)
+AuraLink.app/
+AuraLink
+
+# User/Local configurations
+.idea/
+.vscode/
+*.swp
+*.log
