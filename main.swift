@@ -1698,9 +1698,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                       from: NSRect(origin: .zero, size: logo.size),
                       operation: .sourceOver, fraction: 1.0)
             resizedImage.unlockFocus()
-            resizedImage.isTemplate = false
+            resizedImage.isTemplate = true
             button.image = resizedImage
-            button.contentTintColor = nil  // Tint doesn't apply to non-template images
         } else {
             // Fallback to SF Symbol if logo is not found at all
             let imageName = isConnected ? "wave.3.right.circle.fill" : "wave.3.right.circle"
@@ -1709,16 +1708,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 button.image = NSImage(named: NSImage.Name(imageName))
             }
-            
-            // Tint based on BT power state and connection (only for template/SF Symbol images)
-            let btState = btManager.bluetoothPowerState
-            if btState == .disabled || btState == .unavailable {
-                button.contentTintColor = NSColor(red: 1.0, green: 0.4, blue: 0.0, alpha: 1.0)
-            } else if isConnected {
-                button.contentTintColor = NSColor(red: 0.0, green: 0.8, blue: 0.6, alpha: 1.0)
-            } else {
-                button.contentTintColor = nil
-            }
+        }
+        
+        // Apply tint based on BT power state and connection (works because isTemplate = true)
+        let btState = btManager.bluetoothPowerState
+        if btState == .disabled || btState == .unavailable {
+            button.contentTintColor = NSColor(red: 1.0, green: 0.4, blue: 0.0, alpha: 1.0)
+        } else if isConnected {
+            button.contentTintColor = NSColor(red: 0.0, green: 0.8, blue: 0.6, alpha: 1.0)
+        } else {
+            button.contentTintColor = nil
         }
     }
     
