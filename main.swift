@@ -75,9 +75,12 @@ enum TelemetryRate: Double, CaseIterable, Identifiable {
     }
 }
 
-// KeepAliveManager: Handles silent loop playback to prevent Bluetooth earbud auto-sleep
+// KeepAliveManager: Uses AVAudioEngine to maintain a persistent real-time audio graph
+// that generates sub-audible dither noise. AVAudioEngine is far more resistant to
+// macOS audio session interruptions and route changes than AVAudioPlayer.
 class KeepAliveManager: ObservableObject {
-    private var audioPlayer: AVAudioPlayer?
+    private var audioEngine: AVAudioEngine?
+    private var sourceNode: AVAudioSourceNode?
     @Published var isRunning = false
     
     func start() {
@@ -85,90 +88,93 @@ class KeepAliveManager: ObservableObject {
         
         let ditherVal = UserDefaults.standard.integer(forKey: "AuraLinkDitherLevel")
         let activeDither = UserDefaults.standard.object(forKey: "AuraLinkDitherLevel") != nil ? ditherVal : 3
+        let ditherBound = Float(activeDither) / 32768.0  // Normalize to -1.0...1.0 range
+        let volume: Float = 0.05  // Master volume multiplier
         
-        if let wavURL = createSilentWAV(ditherLevel: activeDither) {
-            do {
-                audioPlayer = try AVAudioPlayer(contentsOf: wavURL)
-                audioPlayer?.numberOfLoops = -1
-                audioPlayer?.volume = 0.05 // Faint active volume, combined with faint WAV data
-                audioPlayer?.prepareToPlay()
-                audioPlayer?.play()
-                
-                self.isRunning = true
-                print("Keep-Alive: Silent/Dithered playback loop started with level: \(activeDither).")
-            } catch {
-                print("Keep-Alive: AVAudioPlayer error: \(error)")
+        let engine = AVAudioEngine()
+        let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
+        
+        // Create a source node that generates dither noise in real-time
+        let node = AVAudioSourceNode(format: format) { _, _, frameCount, audioBufferList -> OSStatus in
+            let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
+            for buffer in ablPointer {
+                let buf = UnsafeMutableBufferPointer<Float>(
+                    start: buffer.mData?.assumingMemoryBound(to: Float.self),
+                    count: Int(frameCount)
+                )
+                for i in 0..<Int(frameCount) {
+                    if ditherBound > 0 {
+                        buf[i] = Float.random(in: -ditherBound...ditherBound) * volume
+                    } else {
+                        buf[i] = 0.0
+                    }
+                }
             }
+            return noErr
+        }
+        
+        engine.attach(node)
+        engine.connect(node, to: engine.mainMixerNode, format: format)
+        engine.mainMixerNode.outputVolume = 1.0
+        
+        do {
+            engine.prepare()
+            try engine.start()
+            
+            self.audioEngine = engine
+            self.sourceNode = node
+            self.isRunning = true
+            print("Keep-Alive [AVAudioEngine]: Real-time dither pipeline started (bound: \(activeDither), volume: \(volume)).")
+        } catch {
+            print("Keep-Alive [AVAudioEngine]: Failed to start engine: \(error)")
         }
     }
     
     func stop() {
         guard isRunning else { return }
-        audioPlayer?.stop()
+        audioEngine?.stop()
+        if let node = sourceNode {
+            audioEngine?.detach(node)
+        }
+        sourceNode = nil
+        audioEngine = nil
         
         self.isRunning = false
-        print("Keep-Alive: Silent/Dithered playback loop stopped.")
+        print("Keep-Alive [AVAudioEngine]: Pipeline stopped.")
     }
     
-    private func createSilentWAV(ditherLevel: Int) -> URL? {
-        let sampleRate: Int32 = 44100
-        let channels: Int16 = 2
-        let bytesPerSample: Int16 = 2
-        let duration: Double = 1.0
-        let numSamples = Int32(Double(sampleRate) * duration)
-        let dataSize = numSamples * Int32(channels) * Int32(bytesPerSample)
-        let fileSize = 36 + dataSize
-        
-        var header = Data()
-        header.append("RIFF".data(using: .ascii)!)
-        header.append(withUnsafeBytes(of: fileSize.littleEndian) { Data($0) })
-        header.append("WAVE".data(using: .ascii)!)
-        header.append("fmt ".data(using: .ascii)!)
-        
-        let subchunk1Size: Int32 = 16
-        header.append(withUnsafeBytes(of: subchunk1Size.littleEndian) { Data($0) })
-        
-        let audioFormat: Int16 = 1 // PCM
-        header.append(withUnsafeBytes(of: audioFormat.littleEndian) { Data($0) })
-        
-        header.append(withUnsafeBytes(of: channels.littleEndian) { Data($0) })
-        
-        header.append(withUnsafeBytes(of: sampleRate.littleEndian) { Data($0) })
-        
-        let byteRate = sampleRate * Int32(channels) * Int32(bytesPerSample)
-        header.append(withUnsafeBytes(of: byteRate.littleEndian) { Data($0) })
-        
-        let blockAlign = channels * bytesPerSample
-        header.append(withUnsafeBytes(of: blockAlign.littleEndian) { Data($0) })
-        
-        let bitsPerSample = bytesPerSample * 8
-        header.append(withUnsafeBytes(of: bitsPerSample.littleEndian) { Data($0) })
-        
-        header.append("data".data(using: .ascii)!)
-        header.append(withUnsafeBytes(of: dataSize.littleEndian) { Data($0) })
-        
-        // Generate randomized 16-bit PCM values (dither) instead of a flat zero-byte array
-        var samples = [Int16](repeating: 0, count: Int(numSamples * Int32(channels)))
-        let bound = Int16(ditherLevel)
-        if bound > 0 {
-            for i in 0..<samples.count {
-                samples[i] = Int16.random(in: -bound...bound)
-            }
+    /// Health check: if the engine was supposed to be running but silently died, restart it.
+    func ensurePlaying() {
+        guard isRunning else { return }
+        if audioEngine == nil || audioEngine?.isRunning != true {
+            print("Keep-Alive WATCHDOG: AVAudioEngine died silently! Restarting...")
+            self.isRunning = false
+            audioEngine = nil
+            sourceNode = nil
+            start()
         }
-        
-        let pcmData = samples.withUnsafeBufferPointer { Data(buffer: $0) }
-        
-        var wavData = header
-        wavData.append(pcmData)
-        
-        let tempDir = FileManager.default.temporaryDirectory
-        let fileURL = tempDir.appendingPathComponent("auralink_silence.wav")
-        do {
-            try wavData.write(to: fileURL)
-            return fileURL
-        } catch {
-            print("Keep-Alive: WAV write error: \(error)")
-            return nil
+    }
+}
+
+// Bluetooth hardware adapter power state
+enum BluetoothPowerState: String {
+    case enabled = "Enabled"
+    case disabled = "Disabled"
+    case unavailable = "Unavailable"
+    
+    var icon: String {
+        switch self {
+        case .enabled: return "antenna.radiowaves.left.and.right"
+        case .disabled: return "antenna.radiowaves.left.and.right.slash"
+        case .unavailable: return "exclamationmark.triangle.fill"
+        }
+    }
+    
+    var color: (red: Double, green: Double, blue: Double) {
+        switch self {
+        case .enabled: return (0.0, 0.8, 0.6)
+        case .disabled: return (1.0, 0.4, 0.0)
+        case .unavailable: return (1.0, 0.2, 0.2)
         }
     }
 }
@@ -186,6 +192,18 @@ class BluetoothManager: ObservableObject {
     @Published var isLaunchAtLoginEnabled: Bool = false
     @Published var telemetryInterval: Double = 2.0
     @Published var ditherLevel: Int = 3
+    
+    // Bluetooth hardware state
+    @Published var bluetoothPowerState: BluetoothPowerState = .unavailable
+    
+    // Reconnection throttle & backoff state
+    @Published var lastEventMessage: String = ""
+    @Published var connectingAddresses: Set<String> = []
+    var userManuallyDisconnected: Bool = false
+    private var lastConnectionAttemptTime: Date? = nil
+    private var currentBackoffInterval: TimeInterval = 15.0
+    private let baseBackoffInterval: TimeInterval = 15.0
+    private let maxBackoffInterval: TimeInterval = 120.0
     
     var keepAliveManager: KeepAliveManager?
     private var timer: Timer?
@@ -218,13 +236,18 @@ class BluetoothManager: ObservableObject {
             self.isLaunchAtLoginEnabled = UserDefaults.standard.bool(forKey: "AuraLinkLaunchAtLoginEnabled")
         }
         
+        updateBluetoothPowerState()
         updateDevices()
         checkActiveAudioDevice()
         updateTimerInterval()
+        installAudioRouteListener()
     }
     
     func selectDevice(address: String) {
         self.selectedDeviceAddress = address
+        self.userManuallyDisconnected = false  // Reset manual disconnect on new target selection
+        self.currentBackoffInterval = baseBackoffInterval  // Reset backoff
+        self.lastConnectionAttemptTime = nil
         UserDefaults.standard.set(address, forKey: "AuraLinkSelectedDeviceAddress")
         updateDevices()
         checkActiveAudioDevice()
@@ -246,8 +269,11 @@ class BluetoothManager: ObservableObject {
         let interval = telemetryInterval > 0 ? telemetryInterval : 2.0
         
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.updateBluetoothPowerState()
             self?.updateDevices()
             self?.checkActiveAudioDevice()
+            // Watchdog: verify keep-alive player is still alive
+            self?.keepAliveManager?.ensurePlaying()
         }
     }
     
@@ -305,6 +331,61 @@ class BluetoothManager: ObservableObject {
         }
     }
     
+    /// Installs a CoreAudio property listener that fires instantly when the default output device changes.
+    /// This is much faster than polling and ensures the keep-alive player rebinds to the new route immediately.
+    func installAudioRouteListener() {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            DispatchQueue.main,
+            { [weak self] _, _ in
+                guard let self = self else { return }
+                print("CoreAudio Listener: Default output device changed! Recycling keep-alive immediately.")
+                // Force-recycle the keep-alive player so it binds to the new output
+                self.keepAliveManager?.stop()
+                // Small delay to let macOS finish the route switch
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    self.checkActiveAudioDevice()
+                    self.keepAliveManager?.ensurePlaying()
+                }
+            }
+        )
+        print("CoreAudio Listener: Installed default output device change listener.")
+    }
+    
+    func updateBluetoothPowerState() {
+        let controller = IOBluetoothHostController.default()
+        let newState: BluetoothPowerState
+        
+        if controller == nil {
+            newState = .unavailable
+        } else {
+            let power = controller!.powerState.rawValue
+            // kBluetoothHCIPowerStateON = 1, kBluetoothHCIPowerStateOFF = 0
+            switch power {
+            case 1:
+                newState = .enabled
+            case 0:
+                newState = .disabled
+            default:
+                newState = .unavailable
+            }
+        }
+        
+        if self.bluetoothPowerState != newState {
+            DispatchQueue.main.async {
+                self.bluetoothPowerState = newState
+                print("Bluetooth Power State: \(newState.rawValue)")
+            }
+        }
+    }
+    
     func updateDevices() {
         guard let devices = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] else { return }
         
@@ -354,12 +435,30 @@ class BluetoothManager: ObservableObject {
             if self.pairedDevices != models {
                 self.pairedDevices = models
             }
+            let wasConnected = self.isTargetDeviceConnected
             if self.isTargetDeviceConnected != targetConnected {
                 self.isTargetDeviceConnected = targetConnected
             }
             if self.targetDeviceRSSI != targetRSSI {
                 self.targetDeviceRSSI = targetRSSI
             }
+            
+            // Reset backoff and manual flag when target device comes online
+            if targetConnected && !wasConnected {
+                self.currentBackoffInterval = self.baseBackoffInterval
+                self.lastConnectionAttemptTime = nil
+                self.userManuallyDisconnected = false
+                if self.lastEventMessage.isEmpty || self.lastEventMessage.hasPrefix("⏳") {
+                    self.lastEventMessage = "✓ Device reconnected!"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
+                        if self.lastEventMessage == "✓ Device reconnected!" {
+                            self.lastEventMessage = ""
+                        }
+                    }
+                }
+                print("Device Reconnected: Backoff reset, manual disconnect cleared.")
+            }
+            
             self.syncKeepAlive()
         }
     }
@@ -391,13 +490,31 @@ class BluetoothManager: ObservableObject {
             
             self.syncKeepAlive()
             
-            // Auto reconnect check
+            // Auto reconnect check with throttle & backoff
             if self.isAutoReconnectEnabled,
+               self.bluetoothPowerState == .enabled,
+               !self.userManuallyDisconnected,
                let targetAddress = self.selectedDeviceAddress,
                let targetDevice = self.pairedDevices.first(where: { $0.address == targetAddress }),
-               !targetDevice.isConnected {
-                print("Auto-Reconnect Daemon: Connecting to \(targetDevice.name)")
-                self.connectDevice(address: targetAddress)
+               !targetDevice.isConnected,
+               !self.connectingAddresses.contains(targetAddress) {
+                
+                // Enforce cooldown: only attempt if enough time has passed
+                let now = Date()
+                if let lastAttempt = self.lastConnectionAttemptTime {
+                    let elapsed = now.timeIntervalSince(lastAttempt)
+                    if elapsed < self.currentBackoffInterval {
+                        let remaining = Int(self.currentBackoffInterval - elapsed)
+                        if self.lastEventMessage.isEmpty || self.lastEventMessage.hasPrefix("⏳") {
+                            self.lastEventMessage = "⏳ Retry backoff: reconnecting in \(remaining)s"
+                        }
+                        print("Auto-Reconnect Throttle: \(remaining)s remaining (backoff: \(Int(self.currentBackoffInterval))s)")
+                        return
+                    }
+                }
+                
+                print("Auto-Reconnect Daemon: Connecting to \(targetDevice.name) (backoff: \(Int(self.currentBackoffInterval))s)")
+                self.connectDevice(address: targetAddress, isAutoReconnect: true)
             }
         }
     }
@@ -412,12 +529,55 @@ class BluetoothManager: ObservableObject {
         }
     }
     
-    func connectDevice(address: String) {
+    func connectDevice(address: String, isAutoReconnect: Bool = false) {
         guard let devices = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] else { return }
-        if let device = devices.first(where: { $0.addressString == address }) {
-            if !device.isConnected() {
-                DispatchQueue.global(qos: .userInitiated).async {
-                    device.openConnection()
+        guard let device = devices.first(where: { $0.addressString == address }) else { return }
+        guard !device.isConnected() else { return }
+        guard !connectingAddresses.contains(address) else {
+            print("Reconnect Guard: Connection already in-flight for \(address). Skipping.")
+            return
+        }
+        
+        // If user manually initiated, clear the manual disconnect flag
+        if !isAutoReconnect {
+            userManuallyDisconnected = false
+        }
+        
+        // Record throttle timestamp
+        lastConnectionAttemptTime = Date()
+        
+        DispatchQueue.main.async {
+            self.connectingAddresses.insert(address)
+            self.lastEventMessage = "Connecting to \(device.name ?? "device")..."
+        }
+        
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = device.openConnection()
+            let resultCode = UInt32(bitPattern: result)
+            let diagnosticMessage = self?.diagnoseIOReturn(resultCode) ?? "Unknown result"
+            
+            DispatchQueue.main.async {
+                self?.connectingAddresses.remove(address)
+                
+                if result == kIOReturnSuccess {
+                    self?.currentBackoffInterval = self?.baseBackoffInterval ?? 15.0
+                    self?.lastEventMessage = "✓ Connected successfully!"
+                    print("Connect Result [\(address)]: Success (0x00000000)")
+                } else {
+                    // Progressive backoff: double interval on failure
+                    if let s = self {
+                        s.currentBackoffInterval = min(s.currentBackoffInterval * 2.0, s.maxBackoffInterval)
+                    }
+                    self?.lastEventMessage = "✗ \(diagnosticMessage)"
+                    print("Connect Result [\(address)]: Failed (0x\(String(resultCode, radix: 16, uppercase: true))) — \(diagnosticMessage)")
+                }
+                
+                // Clear event message after 8 seconds
+                let capturedMessage = self?.lastEventMessage ?? ""
+                DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) {
+                    if self?.lastEventMessage == capturedMessage {
+                        self?.lastEventMessage = ""
+                    }
                 }
             }
         }
@@ -427,10 +587,29 @@ class BluetoothManager: ObservableObject {
         guard let devices = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] else { return }
         if let device = devices.first(where: { $0.addressString == address }) {
             if device.isConnected() {
+                // Mark as manually disconnected to suppress auto-reconnect
+                userManuallyDisconnected = true
+                lastEventMessage = "Disconnected (auto-reconnect paused)"
+                print("Manual Disconnect: User initiated disconnect for \(device.name ?? address). Auto-reconnect paused.")
                 DispatchQueue.global(qos: .userInitiated).async {
                     device.closeConnection()
                 }
             }
+        }
+    }
+    
+    private func diagnoseIOReturn(_ code: UInt32) -> String {
+        switch code {
+        case 0x00000000: return "Connected successfully!"
+        case 0xE00002BC: return "Device not found (unpaired or out of range)"
+        case 0xE00002C0: return "Device not responding (turned off/out of range)"
+        case 0xE00002C5: return "Connection timed out"
+        case 0xE00002C7: return "Resource busy (connection collision)"
+        case 0xE00002C9: return "Device is offline"
+        case 0xE00002D8: return "Bluetooth is powered off"
+        case 0xE00002EB: return "Operation aborted by system"
+        case 0xE00002ED: return "No Bluetooth hardware available"
+        default: return "Connection failed (code: 0x\(String(code, radix: 16, uppercase: true)))"
         }
     }
     
@@ -557,46 +736,82 @@ struct HeaderView: View {
     @ObservedObject var btManager: BluetoothManager
     @ObservedObject var keepAliveManager: KeepAliveManager
     
+    private var btStateColor: Color {
+        let c = btManager.bluetoothPowerState.color
+        return Color(red: c.red, green: c.green, blue: c.blue)
+    }
+    
     var body: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("AURA LINK")
-                    .font(.system(size: 13, weight: .black))
-                    .tracking(2)
-                    .foregroundColor(.white)
-                
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(btManager.isTargetDeviceConnected ? Color(red: 0.0, green: 0.8, blue: 0.6) : .gray)
-                        .frame(width: 5, height: 5)
-                        .shadow(color: btManager.isTargetDeviceConnected ? Color(red: 0.0, green: 0.8, blue: 0.6).opacity(0.8) : .clear, radius: 3)
+        VStack(spacing: 6) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("AURA LINK")
+                        .font(.system(size: 13, weight: .black))
+                        .tracking(2)
+                        .foregroundColor(.white)
                     
-                    Text(btManager.isTargetDeviceConnected ? "STABILIZED" : "MONITORING IDLE")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundColor(btManager.isTargetDeviceConnected ? Color(red: 0.0, green: 0.8, blue: 0.6) : .white.opacity(0.4))
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(btManager.isTargetDeviceConnected ? Color(red: 0.0, green: 0.8, blue: 0.6) : .gray)
+                            .frame(width: 5, height: 5)
+                            .shadow(color: btManager.isTargetDeviceConnected ? Color(red: 0.0, green: 0.8, blue: 0.6).opacity(0.8) : .clear, radius: 3)
+                        
+                        Text(btManager.isTargetDeviceConnected ? "STABILIZED" : "MONITORING IDLE")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundColor(btManager.isTargetDeviceConnected ? Color(red: 0.0, green: 0.8, blue: 0.6) : .white.opacity(0.4))
+                    }
                 }
+                
+                Spacer()
+                
+                // Exit App Button
+                Button(action: {
+                    NSApplication.shared.terminate(nil)
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "power")
+                            .font(.system(size: 9, weight: .bold))
+                        Text("Quit")
+                            .font(.system(size: 9, weight: .bold))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.red.opacity(0.65))
+                    .cornerRadius(6)
+                }
+                .buttonStyle(PlainButtonStyle())
+                .help("Quit AuraLink")
             }
             
-            Spacer()
-            
-            // Exit App Button
-            Button(action: {
-                NSApplication.shared.terminate(nil)
-            }) {
-                HStack(spacing: 4) {
-                    Image(systemName: "power")
-                        .font(.system(size: 9, weight: .bold))
-                    Text("Quit")
-                        .font(.system(size: 9, weight: .bold))
+            // Bluetooth Hardware State Badge
+            HStack(spacing: 5) {
+                Image(systemName: btManager.bluetoothPowerState.icon)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(btStateColor)
+                
+                Text("Bluetooth: \(btManager.bluetoothPowerState.rawValue)")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(btStateColor)
+                
+                Spacer()
+                
+                if btManager.bluetoothPowerState == .disabled {
+                    Text("Turn on Bluetooth in System Settings")
+                        .font(.system(size: 8))
+                        .foregroundColor(.white.opacity(0.35))
                 }
-                .foregroundColor(.white)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(Color.red.opacity(0.65))
-                .cornerRadius(6)
             }
-            .buttonStyle(PlainButtonStyle())
-            .help("Quit AuraLink")
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(btStateColor.opacity(0.08))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(btStateColor.opacity(0.15), lineWidth: 0.5)
+                    )
+            )
         }
     }
 }
@@ -725,24 +940,57 @@ struct StatusRadarView: View {
     
     var body: some View {
         GlassCard {
-            HStack(spacing: 12) {
-                RadarPulseView(isPulseActive: keepAliveManager.isRunning)
-                
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(selectedDeviceName)
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundColor(.white)
-                        .lineLimit(1)
+            VStack(spacing: 6) {
+                HStack(spacing: 12) {
+                    RadarPulseView(isPulseActive: keepAliveManager.isRunning)
                     
-                    Text(connectionStatusText)
-                        .font(.system(size: 10))
-                        .foregroundColor(btManager.isTargetDeviceConnected ? .green : .white.opacity(0.4))
-                    
-                    RSSIMonitorView(rssi: btManager.isTargetDeviceConnected ? btManager.targetDeviceRSSI : 0)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(selectedDeviceName)
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                        
+                        Text(connectionStatusText)
+                            .font(.system(size: 10))
+                            .foregroundColor(btManager.isTargetDeviceConnected ? .green : .white.opacity(0.4))
+                        
+                        RSSIMonitorView(rssi: btManager.isTargetDeviceConnected ? btManager.targetDeviceRSSI : 0)
+                    }
+                    Spacer()
                 }
-                Spacer()
+                
+                // Live diagnostic telemetry line
+                if !btManager.lastEventMessage.isEmpty {
+                    HStack(spacing: 4) {
+                        if btManager.lastEventMessage.contains("Connecting") || btManager.lastEventMessage.hasPrefix("⏳") {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .scaleEffect(0.7)
+                        }
+                        Text(btManager.lastEventMessage)
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .foregroundColor(eventMessageColor)
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 3)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(eventMessageColor.opacity(0.08))
+                    )
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
             }
         }
+    }
+    
+    private var eventMessageColor: Color {
+        let msg = btManager.lastEventMessage
+        if msg.contains("✓") { return Color(red: 0.0, green: 0.8, blue: 0.6) }
+        if msg.contains("✗") { return Color(red: 1.0, green: 0.3, blue: 0.3) }
+        if msg.hasPrefix("⏳") { return Color(red: 1.0, green: 0.7, blue: 0.0) }
+        return Color(red: 0.0, green: 0.5, blue: 0.8)
     }
     
     private var selectedDeviceName: String {
@@ -756,6 +1004,9 @@ struct StatusRadarView: View {
     private var connectionStatusText: String {
         if btManager.isTargetDeviceConnected {
             return keepAliveManager.isRunning ? "Active Stabilization Loop" : "Connected (Idle)"
+        }
+        if btManager.userManuallyDisconnected {
+            return "Disconnected (manual — auto-reconnect paused)"
         }
         return "Disconnected"
     }
@@ -838,6 +1089,10 @@ struct DeviceRowView: View {
         device.address == btManager.selectedDeviceAddress
     }
     
+    var isConnecting: Bool {
+        btManager.connectingAddresses.contains(device.address)
+    }
+    
     var body: some View {
         HStack {
             VStack(alignment: .leading, spacing: 1) {
@@ -846,9 +1101,9 @@ struct DeviceRowView: View {
                     .foregroundColor(isSelected ? Color(red: 0.0, green: 0.8, blue: 0.6) : .white)
                     .lineLimit(1)
                 
-                Text(device.isConnected ? "Connected" : "Disconnected")
+                Text(device.isConnected ? "Connected" : (isConnecting ? "Connecting..." : "Disconnected"))
                     .font(.system(size: 9))
-                    .foregroundColor(device.isConnected ? .green : .white.opacity(0.3))
+                    .foregroundColor(device.isConnected ? .green : (isConnecting ? Color(red: 0.0, green: 0.5, blue: 0.8) : .white.opacity(0.3)))
             }
             
             Spacer()
@@ -860,22 +1115,30 @@ struct DeviceRowView: View {
                     .padding(.trailing, 6)
             }
             
-            Button(action: {
-                if device.isConnected {
-                    btManager.disconnectDevice(address: device.address)
-                } else {
-                    btManager.connectDevice(address: device.address)
+            if isConnecting {
+                // Show spinner while connection is in-flight
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.7)
+                    .frame(width: 60)
+            } else {
+                Button(action: {
+                    if device.isConnected {
+                        btManager.disconnectDevice(address: device.address)
+                    } else {
+                        btManager.connectDevice(address: device.address)
+                    }
+                }) {
+                    Text(device.isConnected ? "Disconnect" : "Connect")
+                        .font(.system(size: 9, weight: .bold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(device.isConnected ? Color.red.opacity(0.2) : Color.white.opacity(0.08))
+                        .foregroundColor(device.isConnected ? .red : .white)
+                        .cornerRadius(4)
                 }
-            }) {
-                Text(device.isConnected ? "Disconnect" : "Connect")
-                    .font(.system(size: 9, weight: .bold))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(device.isConnected ? Color.red.opacity(0.2) : Color.white.opacity(0.08))
-                    .foregroundColor(device.isConnected ? .red : .white)
-                    .cornerRadius(4)
+                .buttonStyle(PlainButtonStyle())
             }
-            .buttonStyle(PlainButtonStyle())
         }
         .padding(.vertical, 4)
         .padding(.horizontal, 6)
@@ -1227,7 +1490,7 @@ struct AuraLinkView: View {
                     .foregroundColor(.white.opacity(0.4))
                     .lineLimit(1)
                 Spacer()
-                Text("v1.0")
+                Text("v1.1")
                     .font(.system(size: 8))
                     .foregroundColor(.white.opacity(0.3))
             }
@@ -1294,11 +1557,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.target = self
         }
         
-        // Dynamic status bar icon using Combine subscription
+        // Dynamic status bar icon using Combine subscriptions
         btManager.$isTargetDeviceConnected
             .receive(on: RunLoop.main)
             .sink { [weak self] isConnected in
                 self?.updateMenuBarIcon(isConnected: isConnected)
+            }
+            .store(in: &cancellables)
+        
+        btManager.$bluetoothPowerState
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self = self else { return }
+                self.updateMenuBarIcon(isConnected: self.btManager.isTargetDeviceConnected)
             }
             .store(in: &cancellables)
     }
@@ -1306,19 +1577,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func updateMenuBarIcon(isConnected: Bool) {
         guard let button = statusItem?.button else { return }
         
-        let imageName = isConnected ? "wave.3.right.circle.fill" : "wave.3.right.circle"
-        
-        if #available(macOS 13.0, *) {
-            button.image = NSImage(systemSymbolName: imageName, accessibilityDescription: "AuraLink")
-        } else {
-            button.image = NSImage(named: NSImage.Name(imageName))
+        // Derive Resources path from executable location (works for CLI-compiled apps)
+        var logoImage: NSImage? = nil
+        if let execURL = Bundle.main.executableURL {
+            let resourcesURL = execURL
+                .deletingLastPathComponent()   // Contents/MacOS/
+                .deletingLastPathComponent()   // Contents/
+                .appendingPathComponent("Contents/Resources/AuraLinkLogo.png")
+            logoImage = NSImage(contentsOf: resourcesURL)
+        }
+        // Fallback: try Bundle.main
+        if logoImage == nil {
+            if let path = Bundle.main.path(forResource: "AuraLinkLogo", ofType: "png") {
+                logoImage = NSImage(contentsOfFile: path)
+            }
         }
         
-        // Use neon green tint color when active/stabilized
-        if isConnected {
-            button.contentTintColor = NSColor(red: 0.0, green: 0.8, blue: 0.6, alpha: 1.0)
+        if let logo = logoImage {
+            // Resize to proper menu bar dimensions (18x18 points)
+            let targetSize = NSSize(width: 18, height: 18)
+            let resizedImage = NSImage(size: targetSize)
+            resizedImage.lockFocus()
+            logo.draw(in: NSRect(origin: .zero, size: targetSize),
+                      from: NSRect(origin: .zero, size: logo.size),
+                      operation: .sourceOver, fraction: 1.0)
+            resizedImage.unlockFocus()
+            resizedImage.isTemplate = false
+            button.image = resizedImage
+            button.contentTintColor = nil  // Tint doesn't apply to non-template images
         } else {
-            button.contentTintColor = nil
+            // Fallback to SF Symbol if logo is not found at all
+            let imageName = isConnected ? "wave.3.right.circle.fill" : "wave.3.right.circle"
+            if #available(macOS 13.0, *) {
+                button.image = NSImage(systemSymbolName: imageName, accessibilityDescription: "AuraLink")
+            } else {
+                button.image = NSImage(named: NSImage.Name(imageName))
+            }
+            
+            // Tint based on BT power state and connection (only for template/SF Symbol images)
+            let btState = btManager.bluetoothPowerState
+            if btState == .disabled || btState == .unavailable {
+                button.contentTintColor = NSColor(red: 1.0, green: 0.4, blue: 0.0, alpha: 1.0)
+            } else if isConnected {
+                button.contentTintColor = NSColor(red: 0.0, green: 0.8, blue: 0.6, alpha: 1.0)
+            } else {
+                button.contentTintColor = nil
+            }
         }
     }
     
