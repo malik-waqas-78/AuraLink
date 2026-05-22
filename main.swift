@@ -90,6 +90,7 @@ class KeepAliveManager: ObservableObject {
         let activeDither = UserDefaults.standard.object(forKey: "AuraLinkDitherLevel") != nil ? ditherVal : 3
         let ditherBound = Float(activeDither) / 32768.0  // Normalize to -1.0...1.0 range
         let volume: Float = 0.05  // Master volume multiplier
+        var rngState = UInt64(Date().timeIntervalSinceReferenceDate * 1_000_000) ^ UInt64(activeDither + 1)
         
         let engine = AVAudioEngine()
         let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
@@ -104,7 +105,11 @@ class KeepAliveManager: ObservableObject {
                 )
                 for i in 0..<Int(frameCount) {
                     if ditherBound > 0 {
-                        buf[i] = Float.random(in: -ditherBound...ditherBound) * volume
+                        rngState ^= rngState << 13
+                        rngState ^= rngState >> 7
+                        rngState ^= rngState << 17
+                        let normalized = (Float(rngState & 0xFFFF) / 32767.5) - 1.0
+                        buf[i] = normalized * ditherBound * volume
                     } else {
                         buf[i] = 0.0
                     }
@@ -184,6 +189,7 @@ class BluetoothManager: ObservableObject {
     @Published var pairedDevices: [BluetoothDeviceModel] = []
     @Published var activeAudioDeviceName: String? = nil
     @Published var isTargetDeviceConnected: Bool = false
+    @Published var isTargetAudioOutputActive: Bool = false
     @Published var targetDeviceRSSI: Int = 0
     @Published var selectedDeviceAddress: String? = nil
     @Published var isAutoReconnectEnabled: Bool = true
@@ -207,6 +213,7 @@ class BluetoothManager: ObservableObject {
     
     var keepAliveManager: KeepAliveManager?
     private var timer: Timer?
+    private var audioRouteListener: AudioObjectPropertyListenerBlock?
     
     init() {
         self.selectedDeviceAddress = UserDefaults.standard.string(forKey: "AuraLinkSelectedDeviceAddress")
@@ -241,6 +248,11 @@ class BluetoothManager: ObservableObject {
         checkActiveAudioDevice()
         updateTimerInterval()
         installAudioRouteListener()
+    }
+
+    deinit {
+        timer?.invalidate()
+        removeAudioRouteListener()
     }
     
     func selectDevice(address: String) {
@@ -322,7 +334,7 @@ class BluetoothManager: ObservableObject {
                 if wasRunning {
                     keepAlive.stop()
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                        if self.isKeepAliveEnabled && self.isTargetDeviceConnected {
+                        if self.isKeepAliveEnabled && self.isTargetDeviceConnected && self.isTargetAudioOutputActive {
                             keepAlive.start()
                         }
                     }
@@ -340,23 +352,46 @@ class BluetoothManager: ObservableObject {
             mElement: kAudioObjectPropertyElementMain
         )
         
-        AudioObjectAddPropertyListenerBlock(
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self = self else { return }
+            print("CoreAudio Listener: Default output device changed! Recycling keep-alive immediately.")
+            // Force-recycle the keep-alive player so it binds to the new output
+            self.keepAliveManager?.stop()
+            // Small delay to let macOS finish the route switch
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.checkActiveAudioDevice()
+                self.keepAliveManager?.ensurePlaying()
+            }
+        }
+
+        let status = AudioObjectAddPropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject),
             &address,
             DispatchQueue.main,
-            { [weak self] _, _ in
-                guard let self = self else { return }
-                print("CoreAudio Listener: Default output device changed! Recycling keep-alive immediately.")
-                // Force-recycle the keep-alive player so it binds to the new output
-                self.keepAliveManager?.stop()
-                // Small delay to let macOS finish the route switch
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    self.checkActiveAudioDevice()
-                    self.keepAliveManager?.ensurePlaying()
-                }
-            }
+            listener
         )
-        print("CoreAudio Listener: Installed default output device change listener.")
+        if status == noErr {
+            audioRouteListener = listener
+            print("CoreAudio Listener: Installed default output device change listener.")
+        } else {
+            print("CoreAudio Listener: Failed to install route listener (status: \(status)). Polling will continue.")
+        }
+    }
+
+    func removeAudioRouteListener() {
+        guard let listener = audioRouteListener else { return }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            DispatchQueue.main,
+            listener
+        )
+        audioRouteListener = nil
     }
     
     func updateBluetoothPowerState() {
@@ -393,7 +428,7 @@ class BluetoothManager: ObservableObject {
         var targetConnected = false
         var targetRSSI = 0
         
-        for device in devices {
+        for device in devices where isAudioCapableDevice(device) {
             let address = device.addressString ?? ""
             let isConnected = device.isConnected()
             let name = device.name ?? "Unknown Device"
@@ -422,6 +457,12 @@ class BluetoothManager: ObservableObject {
         
         // Sort alphabetically by name to ensure absolute layout stability
         models.sort { $0.name.localizedCompare($1.name) == .orderedAscending }
+
+        if let selectedDeviceAddress,
+           !models.contains(where: { $0.address == selectedDeviceAddress }) {
+            self.selectedDeviceAddress = nil
+            UserDefaults.standard.removeObject(forKey: "AuraLinkSelectedDeviceAddress")
+        }
         
         // Auto-select first paired audio-video device if none selected yet
         if selectedDeviceAddress == nil, let firstDevice = models.first {
@@ -443,12 +484,12 @@ class BluetoothManager: ObservableObject {
                 self.targetDeviceRSSI = targetRSSI
             }
             
-            // Reset backoff and manual flag when target device comes online
+            // Reset backoff when target device comes online. Manual disconnect suppression stays
+            // in place until the user selects or connects a device from AuraLink.
             if targetConnected && !wasConnected {
                 self.currentBackoffInterval = self.baseBackoffInterval
                 self.lastConnectionAttemptTime = nil
-                self.userManuallyDisconnected = false
-                if self.lastEventMessage.isEmpty || self.lastEventMessage.hasPrefix("⏳") {
+                if !self.userManuallyDisconnected && (self.lastEventMessage.isEmpty || self.lastEventMessage.hasPrefix("⏳")) {
                     self.lastEventMessage = "✓ Device reconnected!"
                     DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
                         if self.lastEventMessage == "✓ Device reconnected!" {
@@ -456,7 +497,7 @@ class BluetoothManager: ObservableObject {
                         }
                     }
                 }
-                print("Device Reconnected: Backoff reset, manual disconnect cleared.")
+                print("Device Reconnected: Backoff reset.")
             }
             
             self.syncKeepAlive()
@@ -468,6 +509,7 @@ class BluetoothManager: ObservableObject {
             DispatchQueue.main.async {
                 let routeChanged = self.activeAudioDeviceName != "Internal Speakers"
                 self.activeAudioDeviceName = "Internal Speakers"
+                self.isTargetAudioOutputActive = false
                 if routeChanged {
                     print("Audio Route Changed to: Internal Speakers. Force-recycling Keep-Alive.")
                     self.keepAliveManager?.stop()
@@ -478,10 +520,12 @@ class BluetoothManager: ObservableObject {
         }
         
         let deviceName = getAudioDeviceName(deviceID: defaultDeviceID) ?? "Internal Speakers"
+        let isBluetoothRoute = isBluetoothDevice(deviceID: defaultDeviceID)
         
         DispatchQueue.main.async {
             let routeChanged = self.activeAudioDeviceName != deviceName
             self.activeAudioDeviceName = deviceName
+            self.isTargetAudioOutputActive = isBluetoothRoute && self.audioRouteMatchesSelectedDevice(deviceName)
             
             if routeChanged {
                 print("Audio Route Changed to: \(deviceName). Force-recycling Keep-Alive.")
@@ -522,7 +566,7 @@ class BluetoothManager: ObservableObject {
     private func syncKeepAlive() {
         guard let keepAlive = keepAliveManager else { return }
         
-        if isKeepAliveEnabled && isTargetDeviceConnected {
+        if isKeepAliveEnabled && isTargetDeviceConnected && isTargetAudioOutputActive {
             keepAlive.start()
         } else {
             keepAlive.stop()
@@ -532,6 +576,7 @@ class BluetoothManager: ObservableObject {
     func connectDevice(address: String, isAutoReconnect: Bool = false) {
         guard let devices = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] else { return }
         guard let device = devices.first(where: { $0.addressString == address }) else { return }
+        guard isAudioCapableDevice(device) else { return }
         guard !device.isConnected() else { return }
         guard !connectingAddresses.contains(address) else {
             print("Reconnect Guard: Connection already in-flight for \(address). Skipping.")
@@ -611,6 +656,54 @@ class BluetoothManager: ObservableObject {
         case 0xE00002ED: return "No Bluetooth hardware available"
         default: return "Connection failed (code: 0x\(String(code, radix: 16, uppercase: true)))"
         }
+    }
+
+    private func isAudioCapableDevice(_ device: IOBluetoothDevice) -> Bool {
+        if device.deviceClassMajor == kBluetoothDeviceClassMajorAudio {
+            return true
+        }
+
+        let audioServiceNames = [
+            "audio",
+            "a2dp",
+            "avrcp",
+            "headset",
+            "handsfree",
+            "hands-free",
+            "speaker",
+            "headphone"
+        ]
+
+        for service in device.services {
+            guard let record = service as? IOBluetoothSDPServiceRecord,
+                  let serviceName = record.getServiceName()?.lowercased() else {
+                continue
+            }
+            if audioServiceNames.contains(where: { serviceName.contains($0) }) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func audioRouteMatchesSelectedDevice(_ routeName: String) -> Bool {
+        guard let selectedDeviceAddress,
+              let selectedDevice = pairedDevices.first(where: { $0.address == selectedDeviceAddress }) else {
+            return false
+        }
+
+        let route = normalizedDeviceName(routeName)
+        let selected = normalizedDeviceName(selectedDevice.name)
+        guard !route.isEmpty, !selected.isEmpty else { return false }
+        return route == selected || route.contains(selected) || selected.contains(route)
+    }
+
+    private func normalizedDeviceName(_ name: String) -> String {
+        name
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .joined()
     }
     
     // CoreAudio Helper Methods
@@ -1003,6 +1096,9 @@ struct StatusRadarView: View {
     
     private var connectionStatusText: String {
         if btManager.isTargetDeviceConnected {
+            if !btManager.isTargetAudioOutputActive {
+                return "Connected (not selected audio output)"
+            }
             return keepAliveManager.isRunning ? "Active Stabilization Loop" : "Connected (Idle)"
         }
         if btManager.userManuallyDisconnected {
@@ -1583,7 +1679,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let resourcesURL = execURL
                 .deletingLastPathComponent()   // Contents/MacOS/
                 .deletingLastPathComponent()   // Contents/
-                .appendingPathComponent("Contents/Resources/AuraLinkLogo.png")
+                .appendingPathComponent("Resources/AuraLinkLogo.png")
             logoImage = NSImage(contentsOf: resourcesURL)
         }
         // Fallback: try Bundle.main

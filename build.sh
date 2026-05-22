@@ -8,12 +8,15 @@ rm -rf AuraLink AuraLink.app
 
 # Get the macOS SDK Path
 SDK_PATH=$(xcrun --show-sdk-path --sdk macosx)
+MODULE_CACHE_DIR="${TMPDIR:-/tmp}/AuraLinkModuleCache"
+mkdir -p "$MODULE_CACHE_DIR"
 echo "📦 Using macOS SDK: $SDK_PATH"
 
 # Compile Swift code
 echo "⚙️ Compiling Swift source..."
 swiftc main.swift \
   -parse-as-library \
+  -module-cache-path "$MODULE_CACHE_DIR" \
   -sdk "$SDK_PATH" \
   -target arm64-apple-macos13.0 \
   -O \
@@ -56,9 +59,17 @@ if [ -f "AuraLinkLogo.png" ]; then
     sips -z 512 512   AuraLinkLogo.png --out "$ICONSET_DIR/icon_512x512.png"    > /dev/null 2>&1
     sips -z 1024 1024 AuraLinkLogo.png --out "$ICONSET_DIR/icon_512x512@2x.png" > /dev/null 2>&1
     
-    iconutil -c icns "$ICONSET_DIR" -o AuraLink.app/Contents/Resources/AppIcon.icns
+    if iconutil -c icns "$ICONSET_DIR" -o AuraLink.app/Contents/Resources/AppIcon.icns 2> /dev/null; then
+        echo "✅ Generated AppIcon.icns in app bundle."
+    else
+        echo "⚠️ iconutil rejected the generated iconset; falling back to tiff2icns."
+        TEMP_ICON_TIFF="${TMPDIR:-/tmp}/AuraLinkLogo.tiff"
+        sips -s format tiff AuraLinkLogo.png --out "$TEMP_ICON_TIFF" > /dev/null 2>&1
+        tiff2icns "$TEMP_ICON_TIFF" AuraLink.app/Contents/Resources/AppIcon.icns
+        rm -f "$TEMP_ICON_TIFF"
+        echo "✅ Generated fallback AppIcon.icns in app bundle."
+    fi
     rm -rf "$ICONSET_DIR"
-    echo "✅ Generated AppIcon.icns in app bundle."
 fi
 
 # Make executable

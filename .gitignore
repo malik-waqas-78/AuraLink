@@ -26,6 +26,7 @@ Icon
 # Compiled App Bundle (should be packaged as ZIP for releases)
 AuraLink.app/
 AuraLink
+AuraLink.zip
 
 # User/Local configurations
 .idea/
